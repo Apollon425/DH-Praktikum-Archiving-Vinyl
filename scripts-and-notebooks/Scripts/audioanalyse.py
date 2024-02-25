@@ -1,19 +1,23 @@
 import librosa
 import numpy as np
+import pandas as pd
 import math
 from scipy.fft import fft, ifft
 import scipy as scipy
+from scipy.signal import spectrogram
+from scipy import signal
 from pydub import AudioSegment
 import sys
+import os
+from pathlib import Path
 import soundfile as sf
 import matplotlib.pyplot as plt
-from pathlib import Path
-from scipy.signal import spectrogram
-import os
+from dtw import dtw
 
 
 
-def compare_audiofiles(path_original_file: str, path_vinyl_digital_file: str, samplerate=44100, segment_duration=0.01, compare_first_x_chunks: int = 500, save_clips: bool = False):
+def compare_audiofiles(path_original_file: str, path_vinyl_digital_file: str, samplerate=44100, segment_duration=0.01, compare_first_x_chunks: int = 500, save_clips: bool = False,
+                       window_type='hann', frame_length=256, hop_length=128):
     """
     Implements the original-vinyl comparison pipeline.
     Splits signals to compare into segments and synchronizes them by trying to find the vinyl offset
@@ -35,127 +39,107 @@ def compare_audiofiles(path_original_file: str, path_vinyl_digital_file: str, sa
     #  segment them into clips of second_duration
     segments_original = split_audio(path_original_file, segment_duration=segment_duration, samplerate=samplerate)
     segments_vinyl = split_audio(path_vinyl_digital_file, segment_duration=segment_duration, offset=music_start_vinyl, samplerate=samplerate)
+    
+    def fft_with_windowing(segment):
+        window = signal.get_window(window_type, frame_length)
+        return np.fft.fft(librosa.stft(segment, n_fft=frame_length, hop_length=hop_length, window=window)[0])
 
     #  iterate over segments and compute their difference considering different audio features
     error_counter = 0
+
+    columns = ['segment number', 'timecode Vinyl', 'MFCC', 'FFT (MSE)', 'FFT (Corr)', 'Avg. Intensity Diff.']
+    df = pd.DataFrame(columns=columns)
+    df = df.reindex(range(int(compare_first_x_chunks * segment_duration)))
+
     for index, segment in enumerate(segments_original):
         #print(index)
         if index == compare_first_x_chunks:
             print(f"index: {index}")
             print(f"{error_counter} segments with problematic artifacts found.")
+            df.to_csv("Temp\\Fehlermaße.csv")
+            df.to_excel("Temp\\Fehlermaße.xlsx")
             return
 
         time_start_clip_vinyl = (index * segment_duration) + music_start_vinyl
+        #segment = librosa.effects.preemphasis(segment, coef=0.99)
+        #segment_vinyl = librosa.effects.preemphasis(segments_vinyl[index], coef=0.99)
+
         segment_vinyl = make_amplitude_equal(segment, segments_vinyl[index])
 
-        if save_clips:
-
-            os.mkdir("..\\Temp")
-            sf.write(f"..\\Temp\\Audio_Samples\\segment_original_{index}.wav", segment, samplerate)
-            sf.write(f"..\\Temp\\Audio_Samples\\segment_vinyl_{index}.wav", segment_vinyl, samplerate)
-
-        #  try calculate MFCC:
-        mfcc_orig = np.mean(librosa.feature.mfcc(y=segment, sr=samplerate, n_mfcc=50))
-        mfcc_digital_vinyl = np.mean(librosa.feature.mfcc(y=segment_vinyl, sr=samplerate, n_mfcc=50))
-        euclidean_distance = np.linalg.norm(mfcc_orig - mfcc_digital_vinyl)
-        print(f"Euclidean distance between MFCCs at index {index}: {euclidean_distance}")
-
-        #  try find peaks:
-        peaks_orig,_ = scipy.signal.find_peaks(segment,height=0)
-        peaks_tp,_ = scipy.signal.find_peaks(segment_vinyl,height=0)
-
-
-        print(f"Number of peaks for index {index}: {len(peaks_orig)}")
-        print(f"Number of peaks for index {index}: {len(peaks_tp)}")
         
 
 
-        #  now compute the differences between the x second clip:
 
-        #  method one: fft + MSE/MAE of absolute differences TODO: make threshold dynamic and return it from fft_correlation
+        if save_clips:
+            if not os.path.exists("Temp"):
+                os.mkdir(f"Temp")
+            
+            sf.write(f"Temp\\segment_original_{index}.wav", segment, samplerate)
+            sf.write(f"Temp\\segment_vinyl_{index}.wav", segment_vinyl, samplerate)
+        
+        #  Compare time domain features
 
+        find_peaks(segment, segment_vinyl, index)
+
+        #  MFCC:
+        mfcc = calculate_mfcc(segment, segment_vinyl, samplerate, index)
+
+
+
+        #  dtw distance:
+        #dtw_dist = dtw_distance(segment, segment_vinyl)
+
+        #  intensity difference:
+        intensity_diff = intensity_difference_stft(segment_original=segment, segment_vinyl=segment_vinyl)
+
+        # bands = [(0, 2000), (2000, 4000), (4000, 6000), (6000, 8000), (8000, 10000)]
+        # intensity_diffs = intensity_difference_bands(segment, segment_vinyl, bands, samplerate=samplerate)
+        # print(f"Intensity differences by band: {intensity_diffs}")
+
+        
+        #  Compare frequency domain features
         fft_result_original = fft(segment)
         fft_result_vinyl = fft(segment_vinyl)
+        # fft_result_original = fft_with_windowing(segment)
+        # fft_result_vinyl = fft_with_windowing(segment_vinyl)
         
-
+        fft_distance = 0
+        fft_corr = 0
         try:
             threshold = 10
-            distance = fft_correlation(fft_result_original, fft_result_vinyl, "MSE")  
 
-            if distance > threshold:
-                #print(f"Error detected at timestamp: {time_start_clip_vinyl}s. Magnitude: {distance}")
+            #  method one: fft + MSE/MAE of absolute differences
+            fft_distance = fft_difference(fft_result_original, fft_result_vinyl, "MSE")  
+            print(f"Distance FFT: {fft_distance}")
+            
+            #  method two fft + correlation
+            fft_corr = fft_similarity_norm_corr(fft_result_original, fft_result_vinyl)
+            print(f"Corr. FFT: {fft_corr}")
+
+
+            #  plot power spectrum
+            extract_power_spectrum(fft_result_original, fft_result_vinyl, index, samplerate, segment_duration)      
+
+            #  count erros
+            if fft_distance > threshold:
+                #print(f"Error detected at timestamp: {time_start_clip_vinyl}s. Magnitude: {fft_distance}")
                 error_counter = error_counter + 1
-
-            #TODO: weitere features extrahieren, aggregieren usw.    
-
-            extract_power_spectrum(fft_result_original, fft_result_vinyl, samplerate, segment_duration)
-            sys.exit()
-
-
-
-            # #  method two (correlation) --> method two im anschluss an method one in eine methode kombinieren?
-            # corr = ifft(fft(segment) * np.conj(fft(segment_vinyl)))
-            # print(f"corr: {corr}")
-            # offset = np.argmax(np.abs(corr)) - (len(segment) - 1)
-            # print(f"offset: {offset}")
-
-            # match = np.correlate(segment_vinyl, segment, mode='valid')  #  mode valid = only perform where signals overlap
-            # print(f"match: {match}")
-
-
+         
 
 
 
         except ValueError as err:
-            print(f"Clips with index {index} are not of the same size.")
+            print(f"Error for segments of index {index}.")
             print(err)
 
+
+        df.loc[index] = [index, time_start_clip_vinyl, mfcc, fft_distance, fft_corr, intensity_diff]
+
     print(f"{error_counter} Fehler gefunden.")
-
-           
-    #  method 2: Gabor Transform:
-    #gabor_transform(segment, segment_vinyl)
+    df.to_csv("Temp\\Fehlermaße.csv")
 
 
 
-
-
-def gabor_transform(clip_1, clip_2) -> None:
-
-    # Gabor Transform (STFT) parameters
-    window_length = 1024
-    overlap = 0.75
-
-    # Compute spectrograms for both signals
-    _, _, spectrogram1 = spectrogram(clip_1, fs=22050, window='hann', nperseg=window_length, noverlap=int(window_length * overlap))
-    _, _, spectrogram2 = spectrogram(clip_2, fs=22050, window='hann', nperseg=window_length, noverlap=int(window_length * overlap))
-
-    # Frequency bins and time bins for the spectrograms
-    frequency_bins = np.fft.fftfreq(window_length, 1 / 22050)
-    time_bins = np.arange(spectrogram1.shape[1])
-
-    # Reshape the spectrogram arrays
-    spectrogram1 = spectrogram1[:len(frequency_bins) - 1, :]
-    spectrogram2 = spectrogram2[:len(frequency_bins) - 1, :]
-
-    # Plot the spectrograms
-    plt.figure()
-    plt.subplot(2, 1, 1)
-    plt.pcolormesh(time_bins, frequency_bins[:-1], 10 * np.log10(spectrogram1), shading='auto', cmap='inferno')
-    plt.colorbar(label='Power Spectral Density (dB)')
-    plt.title('Signal 1 Spectrogram')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Frequency (Hz)')
-
-    plt.subplot(2, 1, 2)
-    plt.pcolormesh(time_bins, frequency_bins[:-1], 10 * np.log10(spectrogram2), shading='auto', cmap='inferno')
-    plt.colorbar(label='Power Spectral Density (dB)')
-    plt.title('Signal 2 Spectrogram')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Frequency (Hz)')
-
-    plt.tight_layout()
-    plt.show()
 
 def split_audio(file_path, segment_duration=0.01, samplerate=44100, offset=0) -> list:
     """
@@ -172,7 +156,7 @@ def split_audio(file_path, segment_duration=0.01, samplerate=44100, offset=0) ->
     # Split audio into segments
     if((len(audio) // segment_length) % segment_duration == 0):
         num_segments = len(audio) // segment_length
-        print(num_segments)
+        #print(num_segments)
     else:
         num_segments = (len(audio) // segment_length) + 1
     
@@ -246,19 +230,22 @@ def make_amplitude_equal2(signal_1: np.ndarray, signal_2: np.ndarray) -> np.ndar
 
     return audio2_scaled
 
-def fft_correlation(original_fft: np.ndarray, vinyl_fft: np.ndarray, error_measure: str = "MSE") -> float:
+
+def fft_difference(original_fft: np.ndarray, vinyl_fft: np.ndarray, error_measure: str = "MSE") -> float:
     """
-    Uses FFT algorithm to calculate the DFT of original and digitized vinyl reproduction.
+    Uses DFT of original and digitized vinyl reproduction.
     Aggregates and returns their differences using the specified distance measure.
+
+    Args:
+        original_fft (np.ndarray): First signal in the frequency domain.
+        vinyl_fft (np.ndarray): Second signal in the frequency domain.
+        error_measure (str): Option for error measure (MSE/MAE/total_energy) 
+
+    Returns:
+        float: Normalized cross-correlation similarity score between -1 and 1.
+
+
     """
-
-    match_scipy = scipy.signal.correlate(original_fft, vinyl_fft, mode="valid", method="fft")
-    print(match_scipy)
-    best_match_index_scipy = np.argmax(match_scipy)
-    worst_match_index_scipy = np.argmin(match_scipy)
-    print(best_match_index_scipy)
-    print(worst_match_index_scipy)
-
 
     difference = abs(original_fft) - abs(vinyl_fft)
     if error_measure == "MSE":
@@ -277,9 +264,7 @@ def fft_correlation(original_fft: np.ndarray, vinyl_fft: np.ndarray, error_measu
     
 def extract_power_spectrum(original_fft: np.ndarray, vinyl_fft: np.ndarray, index: int, samplerate: int = 44100, segment_duration: int = 1):
     """
-
     """
-
 
     power_spectrum_orig = np.abs(original_fft)**2
     power_spectrum_vinyl = np.abs(vinyl_fft)**2
@@ -316,40 +301,148 @@ def extract_power_spectrum(original_fft: np.ndarray, vinyl_fft: np.ndarray, inde
     plt.legend()
     plt.grid(True)
     #plt.show()
-    plt.savefig(f'..\\Temp\\fft_frequency_for_second_{index * segment_duration}')
-    
+    if not os.path.exists("Temp"):
+        os.mkdir("Temp")
+    plt.savefig(f'Temp\\fft_frequency_for_{index}_duration_{str({segment_duration}).replace(".", "pt")}')
+
+
+def fft_similarity_norm_corr(segment_original: np.ndarray, segment_vinyl: np.ndarray) -> float:
+    """
+    Calculates the similarity between two FFT-transformed signals using normalized cross-correlation.
+
+    Args:
+        segment_original (np.ndarray): First signal in the frequency domain.
+        segment_vinyl (np.ndarray): Second signal in the frequency domain.
+
+    Returns:
+        float: Normalized cross-correlation similarity score between -1 and 1.
+    """
+
+    fft_orig = np.fft.fft(segment_original)
+    fft_vinyl = np.fft.fft(segment_vinyl)
+
+    conj_fft_vinyl = np.conj(fft_vinyl)
+    corr = np.fft.ifft(fft_orig * conj_fft_vinyl)
+    corr = corr.real / np.linalg.norm(fft_orig) / np.linalg.norm(conj_fft_vinyl)
+
+    return np.max(corr)
+
+from dtw import dtw
+
+def dtw_distance(signal1, signal2):
+  """
+  Calculates the DTW distance between two audio signals.
+
+  Args:
+    signal1: NumPy array representing the first audio signal.
+    signal2: NumPy array representing the second audio signal.
+
+  Returns:
+    The DTW distance between the signals.
+  """
+  alignment = dtw(signal1, signal2)
+
+  print(f"DTW Distance: {alignment.distance}")
+  return alignment.distance
+
+def find_peaks(segment_original, segment_vinyl, index):
+
+    peaks_orig,_ = scipy.signal.find_peaks(segment_original,height=0)
+    peaks_tp,_ = scipy.signal.find_peaks(segment_vinyl,height=0)
+
+    print(f"Number of peaks for index {index}: {len(peaks_orig)}")
+    print(f"Number of peaks for index {index}: {len(peaks_tp)}")
+
+
+def calculate_mfcc(segment_original, segment_vinyl, samplerate, index):
+    mfcc_orig = np.mean(librosa.feature.mfcc(y=segment_original, sr=samplerate, n_mfcc=40))
+    mfcc_digital_vinyl = np.mean(librosa.feature.mfcc(y=segment_vinyl, sr=samplerate, n_mfcc=40))
+
+    # def minmax_normalize(mfcc):
+    #     print(np.min(mfcc))
+    #     print(np.max(mfcc))
+    #     return (mfcc - np.min(mfcc)) / (np.max(mfcc) - np.min(mfcc))
+
+    # mfcc_orig_norm = minmax_normalize(mfcc_orig)
+    # mfcc_digital_vinyl_norm = minmax_normalize(mfcc_digital_vinyl)
+    #euclidean_distance_mfcc_norm = np.linalg.norm(mfcc_orig_norm - mfcc_digital_vinyl_norm)
+    #print(f"Euclidean distance between MFCCs at index {index}: {euclidean_distance_mfcc_norm}")
+
+    euclidean_distance_mfcc = np.linalg.norm(mfcc_orig - mfcc_digital_vinyl)
+
+    print(f"Euclidean distance between MFCCs at index {index}: {euclidean_distance_mfcc}")
+
+
+    return euclidean_distance_mfcc
+
+
+def intensity_difference_stft(segment_original, segment_vinyl, window_type='hann', frame_length=1024, hop_length=512):
+    """
+    Calculates the intensity difference between two segments using STFT and PSD.
+    """
+
+    def fft_with_windowing(segment):
+        window = signal.get_window(window_type, frame_length)
+        return np.fft.fft(librosa.stft(segment, n_fft=frame_length, hop_length=hop_length, window=window)[0])
+
+    # Perform STFT for both segments
+    stft_original = fft_with_windowing(segment_original)
+    stft_vinyl = fft_with_windowing(segment_vinyl)
+
+    # Calculate PSDs
+    psd_original = np.abs(stft_original)**2
+    psd_vinyl = np.abs(stft_vinyl)**2
+
+    # Compute and average intensity difference across frequency bins
+    intensity_diff = psd_vinyl - psd_original
+    avg_intensity_diff = np.mean(intensity_diff)
+
+    return avg_intensity_diff
+
+def intensity_difference_bands(segment_original, segment_vinyl, bands, window_type='hann', frame_length=1024, hop_length=512, samplerate=44100):
+    """
+    Calculates the intensity difference between two segments for specific frequency bands.
+
+    Args:
+        segment_original (np.ndarray): First segment.
+        segment_vinyl (np.ndarray): Second segment.
+        bands (list of tuples): List of frequency ranges (e.g., [(0, 2000), (2000, 4000), ...]).
+
+    Returns:
+        list of floats: Intensity difference for each frequency band.
+    """
+
+    def fft_with_windowing(segment):
+        window = signal.get_window(window_type, frame_length)
+        return np.abs(librosa.stft(segment, n_fft=frame_length, hop_length=hop_length, window=window)[0])
+
+    # Perform STFT for both segments
+    stft_original = fft_with_windowing(segment_original)
+    stft_vinyl = fft_with_windowing(segment_vinyl)
+
+    # Calculate frequency bins based on sampling rate and window parameters
+    frequency_bins = np.linspace(0, samplerate / 2, int(frame_length / 2) + 1)
+
+    # Calculate and return intensity differences for each band
+    intensity_diffs = []
+    for low_freq, high_freq in bands:
+        mask_original = (frequency_bins >= low_freq) & (frequency_bins < high_freq)
+        mask_vinyl = (frequency_bins >= low_freq) & (frequency_bins < high_freq)
+        intensity_diff = np.mean(stft_vinyl[mask_vinyl] ** 2) - np.mean(stft_original[mask_original] ** 2)
+        intensity_diffs.append(intensity_diff)
+
+    return intensity_diffs
 
 
 if __name__=='__main__':
 
 
-    compare_audiofiles(path_original_file="D:\\Audio\\Komplett\\Original\\10253 WRLP003 VINYLMASTER SIDE A.wav", path_vinyl_digital_file="D:\\Audio\\Komplett\\Vinyl\\29167-A Kratzer.wav", segment_duration=1, compare_first_x_chunks=20)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # Trim the longer file to match the length of the shorter file
-# if offset > 0:
-#     segment_vinyl = segment_vinyl[offset:]
-#     segment = segment[:len(segment_vinyl)]
-# else:
-#     segment = segment[-offset:]
-#     segment_vinyl = segment_vinyl[:len(segment)]
-
-# #mae = np.mean(np.abs(segment - segment_vinyl))
-# match = np.correlate(segment_vinyl, segment, mode='valid')  #  mode valid = only perform where signals overlap
-# print(f"match 2: {match}")
+    compare_audiofiles(
+        path_original_file="D:\\Audio\\Komplett\\Original\\10253 WRLP003 VINYLMASTER SIDE A.wav", 
+        path_vinyl_digital_file="D:\\Audio\\Komplett\\Vinyl\\29167-A Kratzer.wav", 
+        segment_duration=0.5, 
+        compare_first_x_chunks=20,
+        window_type='hann', 
+        frame_length=1024, 
+        hop_length=512,
+        save_clips=True)
